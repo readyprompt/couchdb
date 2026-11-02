@@ -104,33 +104,48 @@ handle_info(_Msg, St) ->
     {noreply, St}.
 
 update_disk_data() ->
-    DiskData = disksup:get_disk_data(),
-    update_disk_data(DiskData).
+    update_dir_percent_used(database_dir),
+    update_dir_percent_used(view_index_dir).
 
-update_disk_data([]) ->
-    ok;
-update_disk_data([{Id, _, PercentUsed} | Rest]) ->
-    IsDatabaseDir = is_database_dir(Id),
-    IsViewIndexDir = is_view_index_dir(Id),
-    if
-        IsDatabaseDir ->
-            ets:insert(?MODULE, {database_dir, PercentUsed});
-        true ->
-            ok
-    end,
-    if
-        IsViewIndexDir ->
-            ets:insert(?MODULE, {view_index_dir, PercentUsed});
-        true ->
-            ok
-    end,
-    update_disk_data(Rest).
+update_dir_percent_used(Key) ->
+    case config:get("couchdb", atom_to_list(Key)) of
+        undefined ->
+            ok;
+        Dir ->
+            case dir_percent_used(Dir) of
+                {ok, PercentUsed} ->
+                    ets:insert(?MODULE, {Key, PercentUsed});
+                error ->
+                    ok
+            end
+    end.
 
-is_database_dir(MntOn) ->
-    same_device(config:get("couchdb", "database_dir"), MntOn).
+%% Ask df about the directory itself. Matching device ids against the
+%% mount list misses directories whose device isn't listed, e.g. inside
+%% a jail or on a nullfs or bind mount, so only fall back to that.
+dir_percent_used(Dir) ->
+    case disksup:get_disk_info(df_path(Dir)) of
+        [{_, TotalKiB, _, PercentUsed} | _] when TotalKiB > 0 ->
+            {ok, PercentUsed};
+        _ ->
+            mount_percent_used(Dir, disksup:get_disk_data())
+    end.
 
-is_view_index_dir(MntOn) ->
-    same_device(config:get("couchdb", "view_index_dir"), MntOn).
+mount_percent_used(_Dir, []) ->
+    error;
+mount_percent_used(Dir, [{MntOn, _, PercentUsed} | Rest]) ->
+    case same_device(Dir, MntOn) of
+        true -> {ok, PercentUsed};
+        false -> mount_percent_used(Dir, Rest)
+    end.
+
+%% disksup passes the path to df through sh unquoted
+df_path(Dir) ->
+    AbsDir = filename:absname(Dir),
+    case os:type() of
+        {unix, _} -> "'" ++ lists:flatten(string:replace(AbsDir, "'", "'\\''", all)) ++ "'";
+        _ -> AbsDir
+    end.
 
 same_device(DirA, DirB) ->
     case {device_id(DirA), device_id(DirB)} of
@@ -208,7 +223,9 @@ enabled_test_() ->
                 ?TDEF_FE(block_background_view_indexing_test),
                 ?TDEF_FE(block_interactive_view_indexing_test),
                 ?TDEF_FE(block_interactive_database_writes_test),
-                ?TDEF_FE(update_disk_data_test)
+                ?TDEF_FE(update_disk_data_test),
+                ?TDEF_FE(update_disk_data_uses_dir_test),
+                ?TDEF_FE(dir_percent_used_quoting_test)
             ]
         }
     }.
@@ -237,5 +254,27 @@ block_interactive_database_writes_test(_) ->
 update_disk_data_test(_) ->
     whereis(?MODULE) ! update_disk_data,
     ?assertEqual({error, unknown_msg}, gen_server:call(?MODULE, foo)).
+
+update_disk_data_uses_dir_test(_) ->
+    DbDir = config:get("couchdb", "database_dir"),
+    [{_, _, _, Expected}] = disksup:get_disk_info(df_path(DbDir)),
+    set_database_dir_percent_used(100),
+    whereis(?MODULE) ! update_disk_data,
+    % sync with the server so the update has run
+    gen_server:call(?MODULE, foo),
+    ?assertEqual(Expected, database_dir_percent_used()).
+
+dir_percent_used_quoting_test(_) ->
+    Parent = ?tempfile(),
+    Dir = filename:join(Parent, "a b'c"),
+    ok = filelib:ensure_path(Dir),
+    try
+        ?assertMatch({ok, P} when is_integer(P), dir_percent_used(Dir)),
+        [{_, TotalKiB, _, _}] = disksup:get_disk_info(df_path(Dir)),
+        ?assert(TotalKiB > 0)
+    after
+        file:del_dir(Dir),
+        file:del_dir(Parent)
+    end.
 
 -endif.
